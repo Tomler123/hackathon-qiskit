@@ -1,4 +1,4 @@
-# bb84_protocol.py
+# bb84_protocol.py (CLEAN FINAL VERSION)
 
 from qiskit import QuantumCircuit, ClassicalRegister
 from qiskit_aer.noise import NoiseModel, depolarizing_error
@@ -13,7 +13,7 @@ import yfinance as yf
 import pandas as pd
 import warnings
 
-# Silence noisy warnings from yfinance/mpl
+# Silence warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -32,11 +32,7 @@ def quantum_seed():
     return int(bitstring, 2)
 
 def _fetch_last_cent_parity(symbol: str):
-    """
-    Download 1 day / 1m data for a symbol, return last cent digit parity:
-      even -> 0, odd -> 1
-    If unavailable, return None.
-    """
+    """Return 0 if last cent digit even, 1 if odd."""
     try:
         data = yf.download(symbol, period="1d", interval="1m", progress=False, auto_adjust=False)
         if data is None or len(data) == 0:
@@ -52,26 +48,17 @@ def _fetch_last_cent_parity(symbol: str):
         return None
 
 def build_market_parity_map(symbols):
-    """
-    Build a cache: {symbol: 0/1} using last cent digit parity.
-    If a symbol fails, it will be missing from the map.
-    """
+    """Fetch parity bits (even/odd last cent digit) for all stocks."""
     parity = {}
     for sym in symbols:
         b = _fetch_last_cent_parity(sym)
         if b is not None:
             parity[sym] = b
-    # If everything failed (offline?), leave empty and we’ll fall back to quantum bits.
-    print(f"[Market Parity Map] { {k: v for k, v in parity.items()} }")
+    print(f"[Market Parity Map] {parity}")
     return parity
 
 def hybrid_quantum_market_random_bits(n_bits=10):
-    """
-    FAST generator:
-      1) Build a parity cache once (1 fetch per symbol).
-      2) For each bit: use quantum seed to pick a stock index, then emit that stock's cached parity.
-      3) If cache is empty/missing symbol, fall back to pure quantum bit (seed % 2).
-    """
+    """Hybrid RNG: quantum picks stock; stock's price last cent defines bit parity."""
     parity_map = build_market_parity_map(STOCKS)
     bits = []
     for _ in range(n_bits):
@@ -79,20 +66,17 @@ def hybrid_quantum_market_random_bits(n_bits=10):
         chosen = STOCKS[seed % len(STOCKS)]
         bit = parity_map.get(chosen, seed % 2)
         bits.append(bit)
-    print(f"[Hybrid Quantum RNG] First 16 bits: {bits[:16]}")
+    print(f"[Hybrid RNG] First bits: {bits[:16]}")
     return bits
 
 # ============== BB84 SIMULATOR ==============
 
-# --- GLOBAL CONSTANTS ---
 BASES = ['Z', 'X']
 KEY_LENGTH = 2000
 TOTAL_ITERATIONS = 10
 NOISE_PROB = 0.05
 SECURITY_THRESHOLD = 0.11
-ALICE_SECRET_MESSAGE = "The blueprint is secure."  # Message to encrypt/decrypt
 
-# Helper function to convert the bit/basis pair to a quantum state symbol
 def get_state_symbol(bit, basis):
     if basis == 'Z':
         return "|0>" if bit == 0 else "|1>"
@@ -100,23 +84,6 @@ def get_state_symbol(bit, basis):
         return "|+>" if bit == 0 else "|->"
     return "??"
 
-# --- MESSAGE ENCRYPTION/DECRYPTION ---
-def text_to_bits(text):
-    return [int(b) for char in text for b in bin(ord(char))[2:].zfill(8)]
-
-def bits_to_text(bits):
-    chars = []
-    for i in range(0, len(bits), 8):
-        byte = "".join(map(str, bits[i:i + 8]))
-        chars.append(chr(int(byte, 2)))
-    return "".join(chars)
-
-def xor_message(bit_message, bit_key):
-    key_length = len(bit_key)
-    full_key = [bit_key[i % key_length] for i in range(len(bit_message))]
-    return [m ^ k for m, k in zip(bit_message, full_key)]
-
-# --- CORE BB84 FUNCTIONS ---
 def alice_encode(bit, basis):
     qc = QuantumCircuit(1)
     if bit == 1:
@@ -142,8 +109,7 @@ def bob_measure(qc_in, basis):
 def eve_eavesdrops(qc_in):
     eve_basis = random.choice(BASES)
     eve_measured_bit, _ = bob_measure(qc_in, eve_basis)
-    qc_forwarded = alice_encode(eve_measured_bit, eve_basis)
-    return qc_forwarded
+    return alice_encode(eve_measured_bit, eve_basis)
 
 def create_noise_model(error_probability=NOISE_PROB):
     noise_model = NoiseModel()
@@ -152,48 +118,34 @@ def create_noise_model(error_probability=NOISE_PROB):
     return noise_model
 
 def execute_protocol_run(key_length, scenario='ideal', noise_prob=0.0):
-    # ---- CREATIVE RNG: Hybrid Quantum–Market bits (single call → FAST)
     alice_bits = np.array(hybrid_quantum_market_random_bits(key_length))
-
-    # Bases can remain classical-random (or you can swap to hybrid as well if you want)
     alice_bases = [random.choice(BASES) for _ in range(key_length)]
     bob_bases = [random.choice(BASES) for _ in range(key_length)]
     bob_measured_bits = []
+    sample_data, sample_circuit = [], None
 
-    sample_data = []
-    sample_circuit = None
-
-    noise_model = None
-    if scenario == 'noise':
-        noise_model = create_noise_model(noise_prob)
-
+    noise_model = create_noise_model(noise_prob) if scenario == 'noise' else None
     simulator = Aer.get_backend('qasm_simulator')
 
     for i in range(key_length):
         qc_in = alice_encode(alice_bits[i], alice_bases[i])
-        qc_to_measure = qc_in.copy()
-
-        if scenario == 'eve':
-            qc_to_measure = eve_eavesdrops(qc_in)
-
+        qc_to_measure = eve_eavesdrops(qc_in) if scenario == 'eve' else qc_in.copy()
         qc_to_measure.add_register(ClassicalRegister(1, name='cbit'))
         if bob_bases[i] == 'X':
             qc_to_measure.h(0)
         qc_to_measure.measure(0, 0)
 
         job = simulator.run(qc_to_measure, shots=1, noise_model=noise_model)
-        result = job.result()
-        counts = result.get_counts()
+        counts = job.result().get_counts()
         measured_bit = int(list(counts.keys())[0])
         bob_measured_bits.append(measured_bit)
 
         if i < 3:
             sift_status = "Match" if alice_bases[i] == bob_bases[i] else "Mismatch"
-            state_symbol = get_state_symbol(alice_bits[i], alice_bases[i])
             sample_data.append({
                 'A_bit': int(alice_bits[i]),
                 'A_basis': alice_bases[i],
-                'Q_state': state_symbol,
+                'Q_state': get_state_symbol(alice_bits[i], alice_bases[i]),
                 'B_basis': bob_bases[i],
                 'B_bit': measured_bit,
                 'Status': sift_status
@@ -201,25 +153,20 @@ def execute_protocol_run(key_length, scenario='ideal', noise_prob=0.0):
             if i == 0:
                 sample_circuit = qc_in.draw(output='text', idle_wires=False)
 
-    sifted_alice_key = []
-    sifted_bob_key = []
+    sifted = [(a, b) for a, b, ab, bb in zip(alice_bits, bob_measured_bits, alice_bases, bob_bases) if ab == bb]
+    if sifted:
+        a_bits, b_bits = zip(*sifted)
+    else:
+        a_bits, b_bits = [], []
 
-    for i in range(key_length):
-        if alice_bases[i] == bob_bases[i]:
-            sifted_alice_key.append(int(alice_bits[i]))
-            sifted_bob_key.append(bob_measured_bits[i])
+    errors = sum(a != b for a, b in zip(a_bits, b_bits))
+    sifted_len = len(a_bits)
+    qber = errors / sifted_len if sifted_len else 0.0
 
-    sifted_alice_key = np.array(sifted_alice_key)
-    sifted_bob_key = np.array(sifted_bob_key)
+    return qber, sifted_len, errors, sample_data, sample_circuit, a_bits, b_bits
 
-    errors = np.sum(sifted_alice_key != sifted_bob_key)
-    sifted_length = len(sifted_alice_key)
+# ============== GUI APPLICATION ==============
 
-    qber = errors / sifted_length if sifted_length > 0 else 0.0
-
-    return qber, sifted_length, errors, sample_data, sample_circuit, sifted_alice_key, sifted_bob_key
-
-# --- GUI APPLICATION ---
 class BB84App:
     def __init__(self, master):
         self.master = master
@@ -232,34 +179,26 @@ class BB84App:
         self.print_initial_checks()
 
     def setup_ui(self):
-        control_frame = ttk.Frame(self.master, padding="10")
-        control_frame.pack(side=tk.TOP, fill=tk.X)
+        control = ttk.Frame(self.master, padding="10")
+        control.pack(side=tk.TOP, fill=tk.X)
 
         self.status_text = tk.StringVar(value="Ready to run first security audit.")
-        status_label = ttk.Label(control_frame, textvariable=self.status_text, wraplength=400, justify=tk.LEFT)
-        status_label.pack(side=tk.LEFT, padx=10)
+        ttk.Label(control, textvariable=self.status_text, wraplength=400, justify=tk.LEFT).pack(side=tk.LEFT, padx=10)
+        ttk.Button(control, text=f"Run Security Audit 1/{TOTAL_ITERATIONS}", command=self.run_next_iteration)\
+            .pack(side=tk.RIGHT, padx=5)
+        ttk.Button(control, text="Exit", command=self.master.quit).pack(side=tk.RIGHT, padx=5)
 
-        self.generate_button = ttk.Button(control_frame, text=f"Run Security Audit 1/{TOTAL_ITERATIONS}",
-                                          command=self.run_next_iteration)
-        self.generate_button.pack(side=tk.RIGHT, padx=5)
-
-        ttk.Button(control_frame, text="Exit", command=self.master.quit).pack(side=tk.RIGHT, padx=5)
-
-        # --- Tabs for different visualizations ---
         self.notebook = ttk.Notebook(self.master)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        # Tab 1: QBER Bar Plot
         self.fig1, self.ax1 = plt.subplots(figsize=(6, 4))
         self.canvas1 = FigureCanvasTkAgg(self.fig1, master=self.notebook)
         self.notebook.add(self.canvas1.get_tk_widget(), text="QBER Bar")
 
-        # Tab 2: QBER Evolution
         self.fig2, self.ax2 = plt.subplots(figsize=(6, 4))
         self.canvas2 = FigureCanvasTkAgg(self.fig2, master=self.notebook)
         self.notebook.add(self.canvas2.get_tk_widget(), text="QBER Evolution")
 
-        # Tab 3: Sifting Efficiency (Pie Chart)
         self.fig3, self.ax3 = plt.subplots(figsize=(5, 4))
         self.canvas3 = FigureCanvasTkAgg(self.fig3, master=self.notebook)
         self.notebook.add(self.canvas3.get_tk_widget(), text="Sifting Efficiency")
@@ -267,70 +206,56 @@ class BB84App:
     def initialize_plots(self):
         self.ax1.clear()
         self.ax1.set_title('QBER Audit (Iteration 0)')
-        self.ax1.set_ylabel('Average Quantum Bit Error Rate (QBER)')
+        self.ax1.set_ylabel('Quantum Bit Error Rate (QBER)')
         self.ax1.set_ylim(0, 0.3)
         self.ax1.axhline(y=SECURITY_THRESHOLD, color='orange', linestyle='--', label='Security Threshold')
         self.ax1.set_xticks(range(3))
-        self.ax1.set_xticklabels(['Ideal', f'Noise ({NOISE_PROB * 100:.0f}%)', 'Eve'])
+        self.ax1.set_xticklabels(['Ideal', f'Noise ({NOISE_PROB*100:.0f}%)', 'Eve'])
         self.ax1.legend()
         self.canvas1.draw()
 
     def print_initial_checks(self):
-        alice_bit = 0
-        alice_basis = 'X'
-        bob_basis = 'Z'
-        mismatch_results = [bob_measure(alice_encode(alice_bit, alice_basis), bob_basis)[0] for _ in range(100)]
-        correct_count = mismatch_results.count(alice_bit)
+        alice_bit, alice_basis, bob_basis = 0, 'X', 'Z'
+        results = [bob_measure(alice_encode(alice_bit, alice_basis), bob_basis)[0] for _ in range(100)]
+        correct = results.count(alice_bit)
         print("\n--- INITIAL QUANTUM CHECK ---")
-        print(f"Bob measured |+> in Z-basis -> Correct {correct_count}/100 (Expected ~50%)")
+        print(f"Bob measured |+> in Z-basis -> Correct {correct}/100 (Expected ~50%)")
         print("-" * 50)
 
     def run_next_iteration(self):
         if self.iteration >= TOTAL_ITERATIONS:
             self.status_text.set("Simulation complete.")
-            self.generate_button.config(state=tk.DISABLED, text="All Audits Complete")
             return
 
         self.iteration += 1
-
-        # --- Run all scenarios ---
-        qber_ideal, sl_ideal, _, _, _, _, _ = execute_protocol_run(KEY_LENGTH, 'ideal')
-        noise_this_round = random.randint(10, 50) / 1000.0
-        qber_noise, _, _, *_ = execute_protocol_run(KEY_LENGTH, 'noise', noise_prob=noise_this_round)
-        qber_eve, _, _, *_ = execute_protocol_run(KEY_LENGTH, 'eve')
+        qber_ideal, sl_ideal, *_ = execute_protocol_run(KEY_LENGTH, 'ideal')
+        noise_now = random.randint(10, 50) / 1000.0
+        qber_noise, *_ = execute_protocol_run(KEY_LENGTH, 'noise', noise_prob=noise_now)
+        qber_eve, *_ = execute_protocol_run(KEY_LENGTH, 'eve')
 
         self.qber_data['ideal'].append(qber_ideal)
         self.qber_data['noise'].append(qber_noise)
         self.qber_data['eve'].append(qber_eve)
 
-        self.update_qber_bar(qber_ideal, qber_noise, qber_eve, noise_level=noise_this_round)
+        self.update_qber_bar(qber_ideal, qber_noise, qber_eve, noise_level=noise_now)
         self.update_qber_evolution()
         self.update_sifting_pie(sl_ideal)
 
         self.status_text.set(f"Audit {self.iteration}/{TOTAL_ITERATIONS} complete.")
-        if self.iteration < TOTAL_ITERATIONS:
-            self.generate_button.config(text=f"Run Security Audit {self.iteration + 1}/{TOTAL_ITERATIONS}")
-        else:
-            self.generate_button.config(text="SECURITY AUDIT COMPLETE!", state=tk.DISABLED)
-            self.status_text.set(f"Simulation complete after {TOTAL_ITERATIONS} audits. Final averages stable.")
+        if self.iteration == TOTAL_ITERATIONS:
+            self.status_text.set("All audits complete. Simulation finished.")
 
     def update_qber_bar(self, q1, q2, q3, noise_level=None):
         qbers = [q1, q2, q3]
-        labels = [
-            'Ideal',
-            f'Channel Noise p={noise_level:.3f}' if noise_level else f'Noise ({NOISE_PROB * 100:.0f}% )',
-            'Eve'
-        ]
+        labels = ['Ideal', f'Noise p={noise_level:.3f}', 'Eve']
         colors = ['green' if q < SECURITY_THRESHOLD else 'red' for q in qbers]
-
         self.ax1.clear()
         bars = self.ax1.bar(labels, qbers, color=colors)
-        self.ax1.axhline(y=SECURITY_THRESHOLD, color='orange', linestyle='--', label='Security Threshold')
+        self.ax1.axhline(y=SECURITY_THRESHOLD, color='orange', linestyle='--', label='Threshold')
         self.ax1.set_ylim(0, 0.3)
-        self.ax1.set_title(f'Iteration {self.iteration} - QBER Summary')
         for bar in bars:
             yval = bar.get_height()
-            self.ax1.text(bar.get_x() + bar.get_width() / 2, yval + 0.005, f'{yval:.3f}', ha='center', va='bottom')
+            self.ax1.text(bar.get_x()+bar.get_width()/2, yval+0.005, f'{yval:.3f}', ha='center')
         self.ax1.legend()
         self.canvas1.draw()
 
@@ -340,31 +265,22 @@ class BB84App:
         self.ax2.plot(x, self.qber_data['ideal'], 'g-o', label='Ideal')
         self.ax2.plot(x, self.qber_data['noise'], 'b-o', label='Noise')
         self.ax2.plot(x, self.qber_data['eve'], 'r-o', label='Eve')
-        self.ax2.axhline(y=SECURITY_THRESHOLD, color='orange', linestyle='--', label='Security Threshold')
-        self.ax2.set_title("QBER Evolution Across Iterations")
+        self.ax2.axhline(y=SECURITY_THRESHOLD, color='orange', linestyle='--', label='Threshold')
         self.ax2.set_xlabel("Iteration")
         self.ax2.set_ylabel("QBER")
-        self.ax2.set_ylim(0, 0.3)
         self.ax2.legend()
         self.canvas2.draw()
 
-    def update_sifting_pie(self, sifted_length):
+    def update_sifting_pie(self, sifted_len):
         self.ax3.clear()
-        kept = sifted_length
-        discarded = KEY_LENGTH - sifted_length
+        kept, discarded = sifted_len, KEY_LENGTH - sifted_len
         total = kept + discarded
         kept_pct = (kept / total) * 100 if total > 0 else 0.0
-
-        wedges, texts, autotexts = self.ax3.pie(
-            [kept, discarded],
-            labels=['Kept (Matching Bases)', 'Discarded'],
-            autopct='%1.1f%%',
-            startangle=90,
-            colors=['#4CAF50', '#FF7043']
-        )
-        self.ax3.text(0, -1.25, f"Sifting Efficiency: {kept_pct:.2f}%", ha='center', va='center',
-                      fontsize=11, fontweight='bold')
-        self.ax3.set_title("Sifting Efficiency (Basis Match Rate)")
+        self.ax3.pie([kept, discarded],
+                     labels=['Kept (Matching Bases)', 'Discarded'],
+                     autopct='%1.1f%%', startangle=90,
+                     colors=['#4CAF50', '#FF7043'])
+        self.ax3.text(0, -1.25, f"Sifting Efficiency: {kept_pct:.2f}%", ha='center', fontsize=11, fontweight='bold')
         self.canvas3.draw()
 
 
