@@ -1,12 +1,88 @@
+# bb84_protocol.py
+
 from qiskit import QuantumCircuit, ClassicalRegister
 from qiskit_aer.noise import NoiseModel, depolarizing_error
 import numpy as np
-from qiskit_aer import Aer
+from qiskit_aer import Aer, AerSimulator
 import random
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import tkinter as tk
 from tkinter import ttk
+import yfinance as yf
+import pandas as pd
+import warnings
+
+# Silence noisy warnings from yfinance/mpl
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# ============== Hybrid Quantum–Market RNG (FAST) ==============
+
+STOCKS = ["AAPL", "MSFT", "NVDA", "GOOG", "AMZN", "META", "TSLA", "NFLX", "INTC", "AMD"]
+
+def quantum_seed():
+    """Generate an 8-bit random integer using Qiskit Aer simulator."""
+    qc = QuantumCircuit(8, 8)
+    qc.h(range(8))
+    qc.measure(range(8), range(8))
+    sim = AerSimulator()
+    result = sim.run(qc, shots=1).result()
+    bitstring = list(result.get_counts().keys())[0]
+    return int(bitstring, 2)
+
+def _fetch_last_cent_parity(symbol: str):
+    """
+    Download 1 day / 1m data for a symbol, return last cent digit parity:
+      even -> 0, odd -> 1
+    If unavailable, return None.
+    """
+    try:
+        data = yf.download(symbol, period="1d", interval="1m", progress=False, auto_adjust=False)
+        if data is None or len(data) == 0:
+            return None
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        if "Close" not in data.columns or len(data["Close"]) == 0:
+            return None
+        last_price = float(data["Close"].iloc[-1])
+        last_cent_digit = int(str(int(round(last_price * 100.0)))[-1])
+        return 0 if (last_cent_digit % 2 == 0) else 1
+    except Exception:
+        return None
+
+def build_market_parity_map(symbols):
+    """
+    Build a cache: {symbol: 0/1} using last cent digit parity.
+    If a symbol fails, it will be missing from the map.
+    """
+    parity = {}
+    for sym in symbols:
+        b = _fetch_last_cent_parity(sym)
+        if b is not None:
+            parity[sym] = b
+    # If everything failed (offline?), leave empty and we’ll fall back to quantum bits.
+    print(f"[Market Parity Map] { {k: v for k, v in parity.items()} }")
+    return parity
+
+def hybrid_quantum_market_random_bits(n_bits=10):
+    """
+    FAST generator:
+      1) Build a parity cache once (1 fetch per symbol).
+      2) For each bit: use quantum seed to pick a stock index, then emit that stock's cached parity.
+      3) If cache is empty/missing symbol, fall back to pure quantum bit (seed % 2).
+    """
+    parity_map = build_market_parity_map(STOCKS)
+    bits = []
+    for _ in range(n_bits):
+        seed = quantum_seed()
+        chosen = STOCKS[seed % len(STOCKS)]
+        bit = parity_map.get(chosen, seed % 2)
+        bits.append(bit)
+    print(f"[Hybrid Quantum RNG] First 16 bits: {bits[:16]}")
+    return bits
+
+# ============== BB84 SIMULATOR ==============
 
 # --- GLOBAL CONSTANTS ---
 BASES = ['Z', 'X']
@@ -16,7 +92,6 @@ NOISE_PROB = 0.05
 SECURITY_THRESHOLD = 0.11
 ALICE_SECRET_MESSAGE = "The blueprint is secure."  # Message to encrypt/decrypt
 
-
 # Helper function to convert the bit/basis pair to a quantum state symbol
 def get_state_symbol(bit, basis):
     if basis == 'Z':
@@ -25,11 +100,9 @@ def get_state_symbol(bit, basis):
         return "|+>" if bit == 0 else "|->"
     return "??"
 
-
 # --- MESSAGE ENCRYPTION/DECRYPTION ---
 def text_to_bits(text):
     return [int(b) for char in text for b in bin(ord(char))[2:].zfill(8)]
-
 
 def bits_to_text(bits):
     chars = []
@@ -38,12 +111,10 @@ def bits_to_text(bits):
         chars.append(chr(int(byte, 2)))
     return "".join(chars)
 
-
 def xor_message(bit_message, bit_key):
     key_length = len(bit_key)
     full_key = [bit_key[i % key_length] for i in range(len(bit_message))]
     return [m ^ k for m, k in zip(bit_message, full_key)]
-
 
 # --- CORE BB84 FUNCTIONS ---
 def alice_encode(bit, basis):
@@ -53,7 +124,6 @@ def alice_encode(bit, basis):
     if basis == 'X':
         qc.h(0)
     return qc
-
 
 def bob_measure(qc_in, basis):
     qc_out = qc_in.copy()
@@ -69,13 +139,11 @@ def bob_measure(qc_in, basis):
     measured_bit = int(list(counts.keys())[0])
     return measured_bit, qc_out
 
-
 def eve_eavesdrops(qc_in):
     eve_basis = random.choice(BASES)
     eve_measured_bit, _ = bob_measure(qc_in, eve_basis)
     qc_forwarded = alice_encode(eve_measured_bit, eve_basis)
     return qc_forwarded
-
 
 def create_noise_model(error_probability=NOISE_PROB):
     noise_model = NoiseModel()
@@ -83,9 +151,11 @@ def create_noise_model(error_probability=NOISE_PROB):
     noise_model.add_quantum_error(error, ['x', 'h'], [0])
     return noise_model
 
-
 def execute_protocol_run(key_length, scenario='ideal', noise_prob=0.0):
-    alice_bits = np.random.randint(2, size=key_length)
+    # ---- CREATIVE RNG: Hybrid Quantum–Market bits (single call → FAST)
+    alice_bits = np.array(hybrid_quantum_market_random_bits(key_length))
+
+    # Bases can remain classical-random (or you can swap to hybrid as well if you want)
     alice_bases = [random.choice(BASES) for _ in range(key_length)]
     bob_bases = [random.choice(BASES) for _ in range(key_length)]
     bob_measured_bits = []
@@ -121,7 +191,7 @@ def execute_protocol_run(key_length, scenario='ideal', noise_prob=0.0):
             sift_status = "Match" if alice_bases[i] == bob_bases[i] else "Mismatch"
             state_symbol = get_state_symbol(alice_bits[i], alice_bases[i])
             sample_data.append({
-                'A_bit': alice_bits[i],
+                'A_bit': int(alice_bits[i]),
                 'A_basis': alice_bases[i],
                 'Q_state': state_symbol,
                 'B_basis': bob_bases[i],
@@ -136,7 +206,7 @@ def execute_protocol_run(key_length, scenario='ideal', noise_prob=0.0):
 
     for i in range(key_length):
         if alice_bases[i] == bob_bases[i]:
-            sifted_alice_key.append(alice_bits[i])
+            sifted_alice_key.append(int(alice_bits[i]))
             sifted_bob_key.append(bob_measured_bits[i])
 
     sifted_alice_key = np.array(sifted_alice_key)
@@ -148,7 +218,6 @@ def execute_protocol_run(key_length, scenario='ideal', noise_prob=0.0):
     qber = errors / sifted_length if sifted_length > 0 else 0.0
 
     return qber, sifted_length, errors, sample_data, sample_circuit, sifted_alice_key, sifted_bob_key
-
 
 # --- GUI APPLICATION ---
 class BB84App:
