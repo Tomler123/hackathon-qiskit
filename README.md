@@ -1,3 +1,4 @@
+# TEAM NAME: DREAM
 # 🔐 BB84 Quantum Key Distribution Simulator (Hybrid Quantum–Market RNG)
 
 ### 🧠 Built with Qiskit • Python • Matplotlib • Tkinter  
